@@ -1,0 +1,87 @@
+# Builds the GradeGuide website from github.com/gradeguide/gradeguide and
+# publishes it at https://gradeguide.github.io/.
+#
+# It runs every hour and does nothing when the source's main branch has not
+# changed since the last deploy. "Run workflow" deploys at once, and can
+# deploy another branch of the source for a preview.
+name: Deploy
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of gradeguide/gradeguide to deploy
+        default: main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      skip: ${{ steps.deployed.outputs.cache-hit == 'true' && github.event_name == 'schedule' }}
+    steps:
+      - name: Find the source commit
+        id: source
+        run: |
+          ref="${{ inputs.ref || 'main' }}"
+          sha=$(git ls-remote https://github.com/gradeguide/gradeguide.git "$ref" "refs/heads/$ref" | head -n1 | cut -f1)
+          if [ -z "$sha" ]; then sha="$ref"; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Check whether this commit is already deployed
+        id: deployed
+        uses: actions/cache/restore@v4
+        with:
+          path: .deployed
+          key: deployed-${{ steps.source.outputs.sha }}
+          lookup-only: true
+      - if: steps.deployed.outputs.cache-hit != 'true' || github.event_name != 'schedule'
+        uses: actions/checkout@v4
+        with:
+          repository: gradeguide/gradeguide
+          ref: ${{ steps.source.outputs.sha }}
+      - if: steps.deployed.outputs.cache-hit != 'true' || github.event_name != 'schedule'
+        uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: deploy
+          # The pinned Knowledge Graph export is about 1 GB; keep it between runs.
+          repository-cache: true
+      - if: steps.deployed.outputs.cache-hit != 'true' || github.event_name != 'schedule'
+        name: Build the site
+        run: |
+          bazel build //site:site
+          cp -RL bazel-bin/site/site _site
+          chmod -R u+w _site
+          rm -f _site/*.map
+      - if: steps.deployed.outputs.cache-hit != 'true' || github.event_name != 'schedule'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Remember the deployed commit
+        run: mkdir -p .deployed && echo "${{ needs.build.outputs.sha }}" > .deployed/sha
+      - uses: actions/cache/save@v4
+        with:
+          path: .deployed
+          key: deployed-${{ needs.build.outputs.sha }}
